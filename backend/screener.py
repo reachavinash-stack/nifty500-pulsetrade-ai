@@ -14,7 +14,6 @@ from zoneinfo import ZoneInfo
 
 import numpy as np
 import pandas as pd
-import pandas_ta as ta
 import requests
 import yfinance as yf
 from google import genai
@@ -36,19 +35,13 @@ BASE_DIR = Path(__file__).resolve().parent
 FALLBACK_CSV_PATH = BASE_DIR / "data" / "ind_nifty500list_fallback.csv"
 OUTPUT_JSON_PATH = BASE_DIR.parent / "frontend" / "public" / "data" / "scan_results.json"
 
-MAX_PROXIMITY_PCT = 5.0       # Keep up to 5% in JSON so frontend slider (2%-5%) works dynamically
-PRIORITY_PROXIMITY_PCT = 2.0  # Flag <= 2% as high-priority setups
+MAX_PROXIMITY_PCT = 5.0
+PRIORITY_PROXIMITY_PCT = 2.0
 
 
 # ---------------------------------------------------------------------------
 # 1. Pydantic Schemas for Gemini 2.5 Flash Structured Output
 # ---------------------------------------------------------------------------
-class CatalystSource(BaseModel):
-    title: str
-    url: str
-    published_at: str
-
-
 class SentimentEvaluation(BaseModel):
     sentiment: Literal["POSITIVE", "NEGATIVE", "NEUTRAL"] = Field(
         description="Overall regulatory and fundamental news sentiment over the past 30-60 days."
@@ -83,7 +76,6 @@ def fetch_nifty500_constituents() -> pd.DataFrame:
         df = pd.read_csv(io.StringIO(resp.text))
         if "Symbol" not in df.columns or len(df) < 400:
             raise ValueError("Unexpected CSV structure from Nifty Indices.")
-        # Refresh local fallback cache
         FALLBACK_CSV_PATH.parent.mkdir(parents=True, exist_ok=True)
         df.to_csv(FALLBACK_CSV_PATH, index=False)
         logger.info(f"Loaded {len(df)} Nifty 500 constituents from live NSE feed.")
@@ -101,8 +93,35 @@ def fetch_nifty500_constituents() -> pd.DataFrame:
 
 
 # ---------------------------------------------------------------------------
-# 3. Technical Analysis & Proximity Engine (pandas-ta)
+# 3. Technical Analysis & Proximity Engine (Pure Pandas / NumPy)
 # ---------------------------------------------------------------------------
+def compute_indicators(df: pd.DataFrame) -> pd.DataFrame:
+    close = df["Close"].astype(float)
+
+    # 50-day and 200-day Simple Moving Averages
+    df["SMA_50"] = close.rolling(window=50, min_periods=50).mean()
+    df["SMA_200"] = close.rolling(window=200, min_periods=200).mean()
+
+    # MACD (12, 26, 9)
+    ema_12 = close.ewm(span=12, adjust=False).mean()
+    ema_26 = close.ewm(span=26, adjust=False).mean()
+    df["MACD_12_26_9"] = ema_12 - ema_26
+    df["MACDs_12_26_9"] = df["MACD_12_26_9"].ewm(span=9, adjust=False).mean()
+    df["MACDh_12_26_9"] = df["MACD_12_26_9"] - df["MACDs_12_26_9"]
+
+    # 14-day Wilder's RSI
+    delta = close.diff()
+    gain = delta.clip(lower=0.0)
+    loss = -delta.clip(upper=0.0)
+    avg_gain = gain.ewm(alpha=1 / 14, min_periods=14, adjust=False).mean()
+    avg_loss = loss.ewm(alpha=1 / 14, min_periods=14, adjust=False).mean()
+    rs = avg_gain / avg_loss.replace(0, np.nan)
+    df["RSI_14"] = 100.0 - (100.0 / (1.0 + rs))
+    df["RSI_14"] = df["RSI_14"].fillna(100.0)
+
+    return df
+
+
 def evaluate_ticker_technicals(
     symbol: str,
     company_name: str,
@@ -113,23 +132,15 @@ def evaluate_ticker_technicals(
     if len(df) < 210:
         return None
 
-    # Compute indicators via pandas-ta
-    df.ta.sma(length=50, append=True)
-    df.ta.sma(length=200, append=True)
-    df.ta.macd(fast=12, slow=26, signal=9, append=True)
-    df.ta.rsi(length=14, append=True)
-
+    df = compute_indicators(df)
     required_cols = ["SMA_50", "SMA_200", "MACD_12_26_9", "MACDs_12_26_9", "MACDh_12_26_9", "RSI_14"]
-    if not all(col in df.columns for col in required_cols):
-        return None
-
     df = df.dropna(subset=required_cols)
     if len(df) < 10:
         return None
 
     curr = df.iloc[-1]
     prev = df.iloc[-2]
-    last_5 = df.iloc[-6:-1]  # Previous 5 trading sessions
+    last_5 = df.iloc[-6:-1]
 
     close_price = float(curr["Close"])
     sma50 = float(curr["SMA_50"])
@@ -151,12 +162,11 @@ def evaluate_ticker_technicals(
     dist_52w_low_pct = round(abs(close_price - low_52w) / low_52w * 100, 2)
     dist_atl_pct = round(abs(close_price - atl) / atl * 100, 2)
 
-    # Check LONG criteria
+    # LONG criteria
     is_golden_cross_state = sma50 > sma200
     crossed_above_1d = is_golden_cross_state and (prev["SMA_50"] <= prev["SMA_200"])
     crossed_above_1w = is_golden_cross_state and bool((last_5["SMA_50"] <= last_5["SMA_200"]).any())
 
-    # MACD bullish: line > signal with positive histogram (and fresh cross within 5 days or expanding momentum)
     macd_bull_cross_recent = bool(
         (df.iloc[-5:]["MACD_12_26_9"] <= df.iloc[-5:]["MACDs_12_26_9"]).any()
     )
@@ -165,7 +175,7 @@ def evaluate_ticker_technicals(
     )
     is_rsi_long = 50.0 <= rsi14 <= 70.0
 
-    # Check SHORT criteria
+    # SHORT criteria
     is_death_cross_state = sma50 < sma200
     crossed_below_1d = is_death_cross_state and (prev["SMA_50"] >= prev["SMA_200"])
     crossed_below_1w = is_death_cross_state and bool((last_5["SMA_50"] >= last_5["SMA_200"]).any())
@@ -285,7 +295,7 @@ def run_batch_technical_screen(constituents: pd.DataFrame) -> list[dict]:
             except Exception as exc:
                 logger.debug(f"Error evaluating {yf_ticker}: {exc}")
 
-        time.sleep(1.5)  # Polite rate-limit pause between batches
+        time.sleep(1.5)
 
     logger.info(f"Technical screener passed {len(technical_hits)} stocks within {MAX_PROXIMITY_PCT}% proximity.")
     return technical_hits
@@ -321,7 +331,6 @@ def fetch_indian_news_and_disclosures(
     cutoff_dt = datetime.now(timezone.utc) - timedelta(days=lookback_days)
     items: list[dict] = []
 
-    # A. Google News India RSS (NSE / SEBI / RBI focused)
     query = urllib.parse.quote(f'"{company_name}" NSE OR SEBI OR RBI')
     rss_url = f"https://news.google.com/rss/search?q={query}&hl=en-IN&gl=IN&ceid=IN:en"
     try:
@@ -352,7 +361,6 @@ def fetch_indian_news_and_disclosures(
     except Exception as exc:
         logger.debug(f"Google News RSS error for {symbol}: {exc}")
 
-    # B. NSE Corporate Filings & XBRL Announcements API
     nse_api_url = f"https://www.nseindia.com/api/corporate-announcements?index=equities&symbol={urllib.parse.quote(symbol)}"
     try:
         nse_resp = nse_session.get(nse_api_url, timeout=8)
@@ -426,7 +434,6 @@ Analyze the following technical setup and 30–60 day news/NSE regulatory disclo
         logger.error(f"Gemini API error for {candidate['symbol']}: {exc}")
         return None
 
-    # Strict alignment filter per trading direction
     if candidate["direction"] == "LONG":
         if parsed["sentiment"] != "POSITIVE" or parsed["has_regulatory_red_flag"]:
             return None
@@ -480,9 +487,8 @@ def run_screener(force_run: bool = False) -> dict:
                 verified_longs.append(enriched)
             else:
                 verified_shorts.append(enriched)
-        time.sleep(0.5)  # Respect Gemini RPM limits
+        time.sleep(0.5)
 
-    # Sort by: (1) <= 2% proximity priority, (2) Crossover recency (1D > 1W > ESTABLISHED), (3) Closest % proximity
     recency_rank = {"1D": 0, "1W": 1, "ESTABLISHED": 2}
     sort_key = lambda x: (
         0 if x["is_priority_proximity"] else 1,
