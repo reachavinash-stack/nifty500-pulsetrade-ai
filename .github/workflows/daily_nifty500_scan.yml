@@ -1,0 +1,62 @@
+name: Daily Nifty 500 Pre-Market Scan (8:15 AM IST)
+
+on:
+  schedule:
+    # 02:45 UTC == 08:15 AM IST (30 mins before 09:00 AM IST NSE Pre-Open)
+    - cron: "45 2 * * 1-5"
+  workflow_dispatch:
+    inputs:
+      force_run:
+        description: "Bypass NSE holiday check (true/false)"
+        required: false
+        default: "true"
+
+permissions:
+  contents: write
+
+jobs:
+  screen-and-notify:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+
+    steps:
+      - name: Checkout Repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python 3.11
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: "pip"
+          cache-dependency-path: backend/requirements.txt
+
+      - name: Install Python Dependencies
+        run: pip install -r backend/requirements.txt
+
+      - name: Run Nifty 500 Technical & Gemini Sentiment Screener
+        env:
+          GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
+        run: |
+          if [ "${{ github.event.inputs.force_run }}" == "true" ]; then
+            python backend/screener.py --force
+          else
+            python backend/screener.py
+          fi
+
+      - name: Commit Updated Scan Results JSON
+        run: |
+          git config user.name "PulseTrade Bot"
+          git config user.email "bot@pulsetrade.local"
+          git add frontend/public/data/scan_results.json backend/data/ind_nifty500list_fallback.csv
+          git diff --staged --quiet || git commit -m "chore(scan): update Nifty 500 watchlist [skip ci]"
+          git push
+
+      - name: Push 8:30 AM IST Briefing to Google Tasks & Gmail
+        if: always()
+        env:
+          GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
+          GOOGLE_CLIENT_ID: ${{ secrets.GOOGLE_CLIENT_ID }}
+          GOOGLE_CLIENT_SECRET: ${{ secrets.GOOGLE_CLIENT_SECRET }}
+          GOOGLE_REFRESH_TOKEN: ${{ secrets.GOOGLE_REFRESH_TOKEN }}
+          ALERT_RECIPIENT_EMAIL: ${{ secrets.ALERT_RECIPIENT_EMAIL }}
+        run: python backend/google_tasks_notifier.py
